@@ -1,0 +1,3 @@
+
+#Still needs pytorch 1.5 for aws docker....
+pip install torch torchvision fastai==2.1.8 albumentations
