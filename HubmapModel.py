@@ -1,162 +1,417 @@
-import torchvision
-from fastai.vision.all import *
-from fastai import *
-
+import math
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.utils.model_zoo as model_zoo
 
 
-class FPN(nn.Module):
-    def __init__(self, input_channels: list, output_channels: list):
-        super().__init__()
-        self.convs = nn.ModuleList(
-            [nn.Sequential(nn.Conv2d(in_ch, out_ch * 2, kernel_size=3, padding=1),
-                           nn.ReLU(inplace=True), nn.BatchNorm2d(out_ch * 2),
-                           nn.Conv2d(out_ch * 2, out_ch, kernel_size=3, padding=1))
-             for in_ch, out_ch in zip(input_channels, output_channels)])
 
-    def forward(self, xs: list, last_layer):
-        hcs = [F.interpolate(c(x), scale_factor=2 ** (len(self.convs) - i), mode='bilinear')
-               for i, (c, x) in enumerate(zip(self.convs, xs))]
-        hcs.append(last_layer)
-        return torch.cat(hcs, dim=1)
+class SeparableConv2d(nn.Module):
+    def __init__(self, inplanes, planes, kernel_size=3, stride=1, padding=0, dilation=1, bias=False):
+        super(SeparableConv2d, self).__init__()
+
+        self.conv1 = nn.Conv2d(inplanes, inplanes, kernel_size, stride, padding, dilation,
+                               groups=inplanes, bias=bias)
+        self.pointwise = nn.Conv2d(inplanes, planes, 1, 1, 0, 1, 1, bias=bias)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.pointwise(x)
+        return x
 
 
-class UnetBlock(Module):
-    def __init__(self, up_in_c: int, x_in_c: int, nf: int = None, blur: bool = False,
-                 self_attention: bool = False, **kwargs):
-        super().__init__()
-        self.shuf = PixelShuffle_ICNR(up_in_c, up_in_c // 2, blur=blur, **kwargs)
-        self.bn = nn.BatchNorm2d(x_in_c)
-        ni = up_in_c // 2 + x_in_c
-        nf = nf if nf is not None else max(up_in_c // 2, 32)
-        self.conv1 = ConvLayer(ni, nf, norm_type=None, **kwargs)
-        self.conv2 = ConvLayer(nf, nf, norm_type=None,
-                               xtra=SelfAttention(nf) if self_attention else None, **kwargs)
+def fixed_padding(inputs, kernel_size, rate):
+    kernel_size_effective = kernel_size + (kernel_size - 1) * (rate - 1)
+    pad_total = kernel_size_effective - 1
+    pad_beg = pad_total // 2
+    pad_end = pad_total - pad_beg
+    padded_inputs = F.pad(inputs, (pad_beg, pad_end, pad_beg, pad_end))
+    return padded_inputs
+
+
+class SeparableConv2d_same(nn.Module):
+    def __init__(self, inplanes, planes, kernel_size=3, stride=1, dilation=1, bias=False):
+        super(SeparableConv2d_same, self).__init__()
+
+        self.conv1 = nn.Conv2d(inplanes, inplanes, kernel_size, stride, 0, dilation,
+                               groups=inplanes, bias=bias)
+        self.pointwise = nn.Conv2d(inplanes, planes, 1, 1, 0, 1, 1, bias=bias)
+
+    def forward(self, x):
+        x = fixed_padding(x, self.conv1.kernel_size[0], rate=self.conv1.dilation[0])
+        x = self.conv1(x)
+        x = self.pointwise(x)
+        return x
+
+
+class Block(nn.Module):
+    def __init__(self, inplanes, planes, reps, stride=1, dilation=1, start_with_relu=True, grow_first=True, is_last=False):
+        super(Block, self).__init__()
+
+        if planes != inplanes or stride != 1:
+            self.skip = nn.Conv2d(inplanes, planes, 1, stride=stride, bias=False)
+            self.skipbn = nn.BatchNorm2d(planes)
+        else:
+            self.skip = None
+
+        self.relu = nn.ReLU(inplace=True)
+        rep = []
+
+        filters = inplanes
+        if grow_first:
+            rep.append(self.relu)
+            rep.append(SeparableConv2d_same(inplanes, planes, 3, stride=1, dilation=dilation))
+            rep.append(nn.BatchNorm2d(planes))
+            filters = planes
+
+        for i in range(reps - 1):
+            rep.append(self.relu)
+            rep.append(SeparableConv2d_same(filters, filters, 3, stride=1, dilation=dilation))
+            rep.append(nn.BatchNorm2d(filters))
+
+        if not grow_first:
+            rep.append(self.relu)
+            rep.append(SeparableConv2d_same(inplanes, planes, 3, stride=1, dilation=dilation))
+            rep.append(nn.BatchNorm2d(planes))
+
+        if not start_with_relu:
+            rep = rep[1:]
+
+        if stride != 1:
+            rep.append(SeparableConv2d_same(planes, planes, 3, stride=2))
+
+        if stride == 1 and is_last:
+            rep.append(SeparableConv2d_same(planes, planes, 3, stride=1))
+
+
+        self.rep = nn.Sequential(*rep)
+
+    def forward(self, inp):
+        x = self.rep(inp)
+
+        if self.skip is not None:
+            skip = self.skip(inp)
+            skip = self.skipbn(skip)
+        else:
+            skip = inp
+
+        x += skip
+
+        return x
+
+
+class Xception(nn.Module):
+    """
+    Modified Alighed Xception
+    """
+    def __init__(self, inplanes=3, os=16, pretrained=False):
+        super(Xception, self).__init__()
+
+        if os == 16:
+            entry_block3_stride = 2
+            middle_block_rate = 1
+            exit_block_rates = (1, 2)
+        elif os == 8:
+            entry_block3_stride = 1
+            middle_block_rate = 2
+            exit_block_rates = (2, 4)
+        else:
+            raise NotImplementedError
+
+
+        # Entry flow
+        self.conv1 = nn.Conv2d(inplanes, 32, 3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
         self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, up_in: Tensor, left_in: Tensor) -> Tensor:
-        s = left_in
-        up_out = self.shuf(up_in)
-        cat_x = self.relu(torch.cat([up_out, self.bn(s)], dim=1))
-        return self.conv2(self.conv1(cat_x))
+        self.conv2 = nn.Conv2d(32, 64, 3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(64)
 
+        self.block1 = Block(64, 128, reps=2, stride=2, start_with_relu=False)
+        self.block2 = Block(128, 256, reps=2, stride=2, start_with_relu=True, grow_first=True)
+        self.block3 = Block(256, 728, reps=2, stride=entry_block3_stride, start_with_relu=True, grow_first=True,
+                            is_last=True)
 
-class _ASPPModule(nn.Module):
-    def __init__(self, inplanes, planes, kernel_size, padding, dilation, groups=1):
-        super().__init__()
-        self.atrous_conv = nn.Conv2d(inplanes, planes, kernel_size=kernel_size,
-                                     stride=1, padding=padding, dilation=dilation, bias=False, groups=groups)
+        # Middle flow
+        self.block4  = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block5  = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block6  = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block7  = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block8  = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block9  = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block10 = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block11 = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block12 = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block13 = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block14 = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block15 = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block16 = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block17 = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block18 = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+        self.block19 = Block(728, 728, reps=3, stride=1, dilation=middle_block_rate, start_with_relu=True, grow_first=True)
+
+        # Exit flow
+        self.block20 = Block(728, 1024, reps=2, stride=1, dilation=exit_block_rates[0],
+                             start_with_relu=True, grow_first=False, is_last=True)
+
+        self.conv3 = SeparableConv2d_same(1024, 1536, 3, stride=1, dilation=exit_block_rates[1])
+        self.bn3 = nn.BatchNorm2d(1536)
+
+        self.conv4 = SeparableConv2d_same(1536, 1536, 3, stride=1, dilation=exit_block_rates[1])
+        self.bn4 = nn.BatchNorm2d(1536)
+
+        self.conv5 = SeparableConv2d_same(1536, 2048, 3, stride=1, dilation=exit_block_rates[1])
+        self.bn5 = nn.BatchNorm2d(2048)
+
+        # Init weights
+        self.__init_weight()
+
+        # Load pretrained model
+        if pretrained:
+            self.__load_xception_pretrained()
+
+    def forward(self, x):
+        # Entry flow
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+
+        x = self.block1(x)
+        low_level_feat = x
+        x = self.block2(x)
+        x = self.block3(x)
+
+        # Middle flow
+        x = self.block4(x)
+        x = self.block5(x)
+        x = self.block6(x)
+        x = self.block7(x)
+        x = self.block8(x)
+        x = self.block9(x)
+        x = self.block10(x)
+        x = self.block11(x)
+        x = self.block12(x)
+        x = self.block13(x)
+        x = self.block14(x)
+        x = self.block15(x)
+        x = self.block16(x)
+        x = self.block17(x)
+        x = self.block18(x)
+        x = self.block19(x)
+
+        # Exit flow
+        x = self.block20(x)
+        x = self.conv3(x)
+        x = self.bn3(x)
+        x = self.relu(x)
+
+        x = self.conv4(x)
+        x = self.bn4(x)
+        x = self.relu(x)
+
+        x = self.conv5(x)
+        x = self.bn5(x)
+        x = self.relu(x)
+
+        return x, low_level_feat
+
+    def __init_weight(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                # n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                # m.weight.data.normal_(0, math.sqrt(2. / n))
+                torch.nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+    def __load_xception_pretrained(self):
+        pretrain_dict = model_zoo.load_url('http://data.lip6.fr/cadene/pretrainedmodels/xception-b5690688.pth')
+        model_dict = {}
+        state_dict = self.state_dict()
+
+        for k, v in pretrain_dict.items():
+            print(k)
+            if k in state_dict:
+                if 'pointwise' in k:
+                    v = v.unsqueeze(-1).unsqueeze(-1)
+                if k.startswith('block12'):
+                    model_dict[k.replace('block12', 'block20')] = v
+                elif k.startswith('block11'):
+                    model_dict[k.replace('block11', 'block12')] = v
+                elif k.startswith('conv3'):
+                    model_dict[k] = v
+                elif k.startswith('bn3'):
+                    model_dict[k] = v
+                    model_dict[k.replace('bn3', 'bn4')] = v
+                elif k.startswith('conv4'):
+                    model_dict[k.replace('conv4', 'conv5')] = v
+                elif k.startswith('bn4'):
+                    model_dict[k.replace('bn4', 'bn5')] = v
+                else:
+                    model_dict[k] = v
+        state_dict.update(model_dict)
+        self.load_state_dict(state_dict)
+
+class ASPP_module(nn.Module):
+    def __init__(self, inplanes, planes, rate):
+        super(ASPP_module, self).__init__()
+        if rate == 1:
+            kernel_size = 1
+            padding = 0
+        else:
+            kernel_size = 3
+            padding = rate
+        self.atrous_convolution = nn.Conv2d(inplanes, planes, kernel_size=kernel_size,
+                                            stride=1, padding=padding, dilation=rate, bias=False)
         self.bn = nn.BatchNorm2d(planes)
         self.relu = nn.ReLU()
 
-        self._init_weight()
+        self.__init_weight()
 
     def forward(self, x):
-        x = self.atrous_conv(x)
+        x = self.atrous_convolution(x)
         x = self.bn(x)
 
         return self.relu(x)
 
-    def _init_weight(self):
+    def __init_weight(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
+                # n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                # m.weight.data.normal_(0, math.sqrt(2. / n))
                 torch.nn.init.kaiming_normal_(m.weight)
             elif isinstance(m, nn.BatchNorm2d):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
 
 
-class ASPP(nn.Module):
-    def __init__(self, inplanes=512, mid_c=256, dilations=[6, 12, 18, 24], out_c=None):
-        super().__init__()
-        self.aspps = [_ASPPModule(inplanes, mid_c, 1, padding=0, dilation=1)] + \
-                     [_ASPPModule(inplanes, mid_c, 3, padding=d, dilation=d, groups=4) for d in dilations]
-        self.aspps = nn.ModuleList(self.aspps)
-        self.global_pool = nn.Sequential(nn.AdaptiveMaxPool2d((1, 1)),
-                                         nn.Conv2d(inplanes, mid_c, 1, stride=1, bias=False),
-                                         nn.BatchNorm2d(mid_c), nn.ReLU())
-        out_c = out_c if out_c is not None else mid_c
-        self.out_conv = nn.Sequential(nn.Conv2d(mid_c * (2 + len(dilations)), out_c, 1, bias=False),
-                                      nn.BatchNorm2d(out_c), nn.ReLU(inplace=True))
-        self.conv1 = nn.Conv2d(mid_c * (2 + len(dilations)), out_c, 1, bias=False)
-        self._init_weight()
+class DeepLabv3_plus(nn.Module):
+    def __init__(self, nInputChannels=3, n_classes=1, os=16, pretrained=False, _print=True):
+        if _print:
+            print("Constructing DeepLabv3+ model...")
+            print("Number of classes: {}".format(n_classes))
+            print("Output stride: {}".format(os))
+            print("Number of Input Channels: {}".format(nInputChannels))
+        super(DeepLabv3_plus, self).__init__()
 
-    def forward(self, x):
-        x0 = self.global_pool(x)
-        xs = [aspp(x) for aspp in self.aspps]
-        x0 = F.interpolate(x0, size=xs[0].size()[2:], mode='bilinear', align_corners=True)
-        x = torch.cat([x0] + xs, dim=1)
-        return self.out_conv(x)
+        # Atrous Conv
+        self.xception_features = Xception(nInputChannels, os, pretrained)
 
-    def _init_weight(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                torch.nn.init.kaiming_normal_(m.weight)
-            elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
+        # ASPP
+        if os == 16:
+            rates = [1, 6, 12, 18]
+        elif os == 8:
+            rates = [1, 12, 24, 36]
+        else:
+            raise NotImplementedError
+
+        self.aspp1 = ASPP_module(2048, 256, rate=rates[0])
+        self.aspp2 = ASPP_module(2048, 256, rate=rates[1])
+        self.aspp3 = ASPP_module(2048, 256, rate=rates[2])
+        self.aspp4 = ASPP_module(2048, 256, rate=rates[3])
+
+        self.relu = nn.ReLU()
+
+        self.global_avg_pool = nn.Sequential(nn.AdaptiveAvgPool2d((1, 1)),
+                                             nn.Conv2d(2048, 256, 1, stride=1, bias=False),
+                                             nn.BatchNorm2d(256),
+                                             nn.ReLU())
+
+        self.conv1 = nn.Conv2d(1280, 256, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(256)
+
+        # adopt [1x1, 48] for channel reduction.
+        self.conv2 = nn.Conv2d(128, 48, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(48)
+
+        self.last_conv = nn.Sequential(nn.Conv2d(304, 256, kernel_size=3, stride=1, padding=1, bias=False),
+                                       nn.BatchNorm2d(256),
+                                       nn.ReLU(),
+                                       nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1, bias=False),
+                                       nn.BatchNorm2d(256),
+                                       nn.ReLU(),
+                                       nn.Conv2d(256, n_classes, kernel_size=1, stride=1))
+
+    def forward(self, input):
+        x, low_level_features = self.xception_features(input)
+        x1 = self.aspp1(x)
+        x2 = self.aspp2(x)
+        x3 = self.aspp3(x)
+        x4 = self.aspp4(x)
+        x5 = self.global_avg_pool(x)
+        x5 = F.upsample(x5, size=x4.size()[2:], mode='bilinear', align_corners=True)
+
+        x = torch.cat((x1, x2, x3, x4, x5), dim=1)
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = F.upsample(x, size=(int(math.ceil(input.size()[-2]/4)),
+                                int(math.ceil(input.size()[-1]/4))), mode='bilinear', align_corners=True)
+
+        low_level_features = self.conv2(low_level_features)
+        low_level_features = self.bn2(low_level_features)
+        low_level_features = self.relu(low_level_features)
 
 
-class HubmapModel(nn.Module):
-    def __init__(self, stride=1, **kwargs):
-        super().__init__()
-        # encoder
-        # m = ResNet(Bottleneck, [3, 4, 6, 3], groups=32, width_per_group=4)
-        m = torchvision.models.segmentation.deeplabv3_resnet50(pretrained=False, num_classes=1).cuda()
-        # m = torch.hub.load('facebookresearch/semi-supervised-ImageNet1K-models',
-        #                   'resnext50_32x4d_ssl')
-        self.enc0 = nn.Sequential(m.backbone.conv1, m.backbone.bn1, nn.ReLU(inplace=True))
-        self.enc1 = nn.Sequential(nn.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1),
-                                  m.backbone.layer1)  # 256
-        self.enc2 = m.backbone.layer2  # 512
-        self.enc3 = m.backbone.layer3  # 1024
-        self.enc4 = m.backbone.layer4  # 2048
-        # aspp with customized dilatations
-        self.aspp = m.classifier[0]
-        # self.aspp = ASPP(2048, 256, out_c=512, dilations=[stride * 1, stride * 2, stride * 3, stride * 4])
-        self.drop_aspp = nn.Dropout2d(0.5)
-        # decoder
-        self.dec4 = UnetBlock(256, 1024, 256)
-        self.dec3 = UnetBlock(256, 256, 128)
-        self.dec2 = UnetBlock(128, 256, 64)
-        self.dec1 = UnetBlock(64, 64, 32)
-        self.fpn = FPN([512, 256, 128, 64], [16] * 4)
-        self.drop = nn.Dropout2d(0.1)
-        self.final_conv = ConvLayer(32 + 16 * 4, 1, ks=1, norm_type=None, act_cls=None)
+        x = torch.cat((x, low_level_features), dim=1)
+        x = self.last_conv(x)
+        x = F.upsample(x, size=input.size()[2:], mode='bilinear', align_corners=True)
 
-    def forward(self, x):
-        enc0 = self.enc0(x)
-        enc1 = self.enc1(enc0)
-        enc2 = self.enc2(enc1)
-        enc3 = self.enc3(enc2)
-        enc4 = self.enc4(enc3)
-        enc5 = self.aspp(enc4)
-        dec3 = self.dec4(self.drop_aspp(enc5), enc3)
-        dec2 = self.dec3(dec3, enc2)
-        dec1 = self.dec2(dec2, enc1)
-        dec0 = self.dec1(dec1, enc0)
-        x = self.fpn([enc5, dec3, dec2, dec1], dec0)
-        x = self.final_conv(self.drop(x))
-        x = F.interpolate(x, scale_factor=2, mode='bilinear')
         return x
-# class HubmapModel(nn.Module):
-#     """
-#     DeeplabV3 resnet50 for fastai
-#     """
-#
-#     def __init__(self):
-#         super().__init__()
-#
-#         torchvision.models.segmentation.deeplabv3_resnet50()
-#         self.model = torchvision.models.segmentation.deeplabv3_resnet50(pretrained=False, num_classes=1).cuda()
-#
-#         self.encoder = create_body(torchvision.models.segmentation.deeplabv3_resnet50)
-#
-#     def forward(self, x):
-#         res = self.encoder(x)
-#         return [res['out'], res['aux']]
+
+    def freeze_bn(self):
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+    def __init_weight(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+                # torch.nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+def get_1x_lr_params(model):
+    """
+    This generator returns all the parameters of the net except for
+    the last classification layer. Note that for each batchnorm layer,
+    requires_grad is set to False in deeplab_resnet.py, therefore this function does not return
+    any batchnorm parameter
+    """
+    b = [model.xception_features]
+    for i in range(len(b)):
+        for k in b[i].parameters():
+            if k.requires_grad:
+                yield k
+
+
+def get_10x_lr_params(model):
+    """
+    This generator returns all the parameters for the last layer of the net,
+    which does the classification of pixel into classes
+    """
+    b = [model.aspp1, model.aspp2, model.aspp3, model.aspp4, model.conv1, model.conv2, model.last_conv]
+    for j in range(len(b)):
+        for k in b[j].parameters():
+            if k.requires_grad:
+                yield k
+
+split_layers = lambda m: [list(get_1x_lr_params(m)), list(get_10x_lr_params(m))]
 
 
 if __name__ == "__main__":
-    model = HubmapModel()
-    print(model)
+    model = DeepLabv3_plus(nInputChannels=3, n_classes=1, os=16, pretrained=True, _print=True)
+    model.eval()
+    image = torch.randn(1, 3, 512, 512)
+    with torch.no_grad():
+        output = model.forward(image)
+    print(output.size())

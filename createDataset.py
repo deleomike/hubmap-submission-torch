@@ -18,8 +18,8 @@ def segment(sz):
     """
 
     reduce = 4  # reduce the original images by 4 times
-    MASKS = './input/hubmap-kidney-segmentation/train.csv'
-    DATA = './input/hubmap-kidney-segmentation/train/'
+    MASKS = './hubmap-kidney-segmentation/train.csv'
+    DATA = './hubmap-kidney-segmentation/train/'
     OUT_TRAIN = 'train.zip'
     OUT_MASKS = 'masks.zip'
 
@@ -127,4 +127,4 @@ def segment(sz):
 
 
 if __name__ =="__main__":
-    segment(256)
+    segment(512)
